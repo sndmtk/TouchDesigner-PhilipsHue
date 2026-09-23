@@ -19,8 +19,6 @@ TouchDesignerのTOP画像から、Philips Hueの照明を制御するコンポ�
 
 このリポジトリの[HueBridge.tox](HueBridge.tox)をダウンロードし、TouchDesignerのネットワークエディタへドラッグ＆ドロップします。GitHubのファイル画面では **Download raw file** から取得できます。
 
-`HueBridge_demo.toe`も同梱していますが、最新機能を使う場合は`HueBridge.tox`から始めてください。
-
 ### 2. Hue Bridgeと接続する
 
 コンポーネントのカスタムパラメータで **Bridge** ページを開きます。
