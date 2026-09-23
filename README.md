@@ -179,7 +179,6 @@ APIキーはコンポーネントのカスタムパラメータに保存され�
 | ファイル | 役割 |
 | --- | --- |
 | HueBridge.tox | 利用者向けコンポーネント |
-| HueBridge_demo.toe | 同梱デモ。最新機能はTOXを使用 |
 | src/build_component.py | TouchDesigner内でコンポーネントを構築・書き出し |
 | src/update_component.py | 開いているプロジェクトのHueBridgeを更新 |
 | src/runtime.py | 認証、通信、ライト制御、状態管理 |
