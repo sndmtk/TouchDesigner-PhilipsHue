@@ -4,10 +4,41 @@ import json
 import traceback
 
 ROOT=Path(r'C:/Users/sndmt/Documents/Github Projects/TouchDesigner-PhilipsHue')
+# Keep in sync with OUTPUT_PARS in build_component.py: (name, label, default, min, max).
+OUTPUT_PARS=[
+    ('Maxrate','Max Commands/s',10,1,40),
+    ('Interval','Min Interval per Light (s)',0.1,0,None),
+    ('Refresh','Refresh Unchanged (s)',2,0,None),
+    ('Transition','Transition (s)',1,0,None),
+]
+
+def find_component():
+    """The HueBridge in /project1, whatever it was renamed to."""
+    found=[o for o in op('/project1').children if o.isCOMP and o.op('lifecycle') and o.op('runtime') and o.op('hue_core')]
+    if len(found)!=1:
+        raise RuntimeError('Expected exactly one HueBridge component in /project1, found: '+str([o.path for o in found]))
+    return found[0]
+
+def update_output_pars(c, page):
+    for name,label,default,lo,hi in OUTPUT_PARS:
+        p=getattr(c.par,name,None)
+        if p is None:
+            p=page.appendFloat(name,label=label)[0]
+            p.val=default
+        elif name=='Interval' and p.eval()==1:
+            # Old meaning was "resend every N s" (default 1). It is now the minimum
+            # gap between commands to one light, so the old default would cap each light at 1/s.
+            p.val=default
+        p.label=label
+        p.default=default
+        p.min=lo
+        p.clampMin=True
+        if hi is not None:
+            p.max=hi
+            p.clampMax=True
+
 try:
-    c=op('/project1/HueBridge')
-    if c is None:
-        raise RuntimeError('No /project1/HueBridge component found')
+    c=find_component()
     lifecycle=c.op('lifecycle')
     lifecycle.par.framestart=False
     previous=lifecycle.module.controller
@@ -31,6 +62,8 @@ try:
         p.default='none'
         p.val='none'
         page.appendPulse('Deletelight',label='Delete Selected Device')
+    update_output_pars(c,page)
+    c.op('hue_core').text=(ROOT/'src/hue_core.py').read_text(encoding='utf-8')
     c.op('runtime').text=(ROOT/'src/runtime.py').read_text(encoding='utf-8')
     status=c.op('status')
     for row in reversed(range(1,status.numRows)):

@@ -14,6 +14,8 @@ class Table:
     def __init__(self,headers): self.rows=[headers]
     @property
     def numRows(self): return len(self.rows)
+    @property
+    def numCols(self): return max((len(r) for r in self.rows), default=0)
     def __getitem__(self,pos): return Cell(self.rows[pos[0]][pos[1]])
     def __setitem__(self,pos,val): self.rows[pos[0]][pos[1]]=str(val)
     def appendRow(self,row): self.rows.append(list(row))
@@ -116,13 +118,6 @@ class AuthTests(unittest.TestCase):
         self.assertNotIn('Cloudfallback',runtime_source)
         self.assertNotIn("value=='manual'",runtime_source)
         self.assertIn("p.startSection=True",builder_source)
-
-    def test_unchanged_light_is_resent_after_its_update_interval(self):
-        body={'on':{'on':True}}
-        self.ctrl.sent['a']=body
-        self.ctrl.last_send['a']=99
-        self.assertFalse(self.ctrl.should_send('a',body,99.9))
-        self.assertTrue(self.ctrl.should_send('a',body,100))
 
     def test_inflight_light_does_not_block_another_light(self):
         self.ctrl.control_pending['a']=object()

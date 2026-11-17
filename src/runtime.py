@@ -7,8 +7,15 @@ class Controller:
     def __init__(self, c):
         self.c=c
         self.core=c.op('hue_core').module
+        # One worker + one kept-alive connection each. The Bridge serialises requests
+        # anyway, and a separate control connection keeps polling off the control path.
         self.pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='HueHTTP')
-        self.control_pool=ThreadPoolExecutor(max_workers=16,thread_name_prefix='HueControl')
+        self.control_pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='HueControl')
+        self.client=self.core.Client()
+        self.control_client=self.core.Client()
+        self.tokens=1.0
+        self.token_time=0
+        self.control_pause_until=0
         self.pending=None
         self.control_pending={}
         self.config=None
@@ -24,7 +31,6 @@ class Controller:
         self.unavailable_until={}
         self.lights={}
         self.zigbee_connectivity={}
-        self.cursor=0
         self.auth_stopped=False
         self.last_error=''
         self.last_network=0
@@ -62,10 +68,10 @@ class Controller:
     def light_ready_for_send(self, light_id, now):
         return now>=self.unavailable_until.get(light_id,0)
 
-    def should_send(self, light_id, body, now):
-        previous=self.sent.get(light_id)
-        power_change=previous is None or previous.get('on')!=body['on']
-        return power_change or now-self.last_send.get(light_id,0)>=self.c.par.Interval.eval()
+    def param(self, name, default):
+        # Components built before a parameter existed keep working with its default.
+        p=getattr(self.c.par,name,None)
+        return default if p is None else p.eval()
 
     def control_ready(self, light_id):
         return light_id not in self.control_pending
@@ -86,19 +92,19 @@ class Controller:
     def submit(self,kind,method,path,body=None,light_id=None):
         host,insecure=self.config
         key=self.c.par.Apikey.eval() if self.c.par.Keyhost.eval()==host else ''
-        f=self.pool.submit(self.core.request,host,key,method,path,body,insecure)
+        f=self.pool.submit(self.client.request,host,key,method,path,body,insecure)
         self.pending=(f,kind,(self.config,self.generation),light_id,body)
         self.last_network=time.monotonic()
 
-    def submit_control(self, light_id, body):
+    def submit_control(self, light_id, body, new_state=None):
         host,insecure=self.config
         key=self.c.par.Apikey.eval() if self.c.par.Keyhost.eval()==host else ''
-        future=self.control_pool.submit(self.core.request,host,key,'PUT','/clip/v2/resource/light/'+light_id,body,insecure)
-        self.control_pending[light_id]=(future,(self.config,self.generation),body)
+        future=self.control_pool.submit(self.control_client.request,host,key,'PUT','/clip/v2/resource/light/'+light_id,body,insecure)
+        self.control_pending[light_id]=(future,(self.config,self.generation),body,new_state)
 
     def receive_controls(self, now):
         for light_id,item in list(self.control_pending.items()):
-            future,config,body=item
+            future,config,body,new_state=item
             if not future.done():
                 continue
             self.control_pending.pop(light_id,None)
@@ -110,9 +116,17 @@ class Controller:
                     self.ready=False
                     self.auth_stopped=True
                     raise ValueError('API key rejected. Use Forget Key to pair again.')
+                if code==429:
+                    # Bridge-wide rate limit: slow everything down instead of
+                    # benching one light. The command was not applied, so the
+                    # cached state stays and the change is sent again later.
+                    self.control_pause_until=now+1
+                    self.status('rate_limit','Bridge rate limit (429); pausing output 1 s. Lower Max Commands/s')
+                    self.error('HTTP 429 Too Many Requests')
+                    continue
                 if not isinstance(result,dict) or code>=400 or result.get('errors'):
                     raise ValueError(str(result))
-                self.sent[light_id]=body
+                self.sent[light_id]=new_state if new_state is not None else body
                 self.unavailable_until.pop(light_id,None)
                 self.status('last_send',time.strftime('%H:%M:%S'))
                 self.last_error=''
@@ -160,6 +174,8 @@ class Controller:
             self.deadline=0
             self.next_auth=0
             self.sent.clear()
+            # Give immediate feedback; the next network result replaces this message.
+            self.status('state','Connecting to '+(self.bridge_ip() or '(no Bridge IP)')+'...')
         elif name=='Forgetkey':
             self.c.par.Apikey.val=''
             self.c.par.Keyhost.val=''
@@ -316,8 +332,8 @@ class Controller:
             self.deadline=0
             self.next_auth=0
         self.receive_controls(now)
-        if self.pending and not self.receive(now):
-            return
+        if self.pending:
+            self.receive(now)
         if not host:
             return
         try:
@@ -325,9 +341,15 @@ class Controller:
         except ValueError:
             self.error('Bridge IP must be an IPv4 address')
             return
+        key=self.c.par.Apikey.eval() if self.c.par.Keyhost.eval()==host else ''
+        # Light output runs every frame on its own connection, even while a
+        # light-list poll or management request is still in flight.
+        if self.ready and key and not self.auth_stopped:
+            self.control_step(now)
+        if self.pending:
+            return
         if now<self.next_auth or self.auth_stopped:
             return
-        key=self.c.par.Apikey.eval() if self.c.par.Keyhost.eval()==host else ''
         if not key:
             if not self.deadline:
                 self.deadline=now+60
@@ -359,15 +381,38 @@ class Controller:
             kind=self.telemetry_queue.pop(0)
             self.submit(kind,'GET','/clip/v2/resource/'+kind)
             return
+
+    def take_token(self, now):
+        """Bridge-wide token bucket (Max Commands/s). Holds at most one token, so
+        commands are spaced evenly and never burst into the Bridge's queue."""
+        rate=max(0.5,min(40.0,float(self.param('Maxrate',10))))
+        self.tokens=min(1.0,self.tokens+(now-self.token_time)*rate)
+        self.token_time=now
+        if self.tokens<1.0:
+            return False
+        self.tokens-=1.0
+        return True
+
+    def control_step(self, now):
+        """Send at most one light command, choosing the light whose visible state
+        differs most from what it last confirmed (stale lights get a bonus)."""
         if not self.c.par.Send.eval():
             self.sent.clear()
+            return
+        # Exactly one command in flight: values are read from the TOP at send
+        # time, so nothing stale ever waits in a queue.
+        if self.control_pending or now<self.control_pause_until:
             return
         mapping=self.c.op('mapping')
         rows=list(range(1,mapping.numRows))
         if not rows:
             return
+        rate=max(0.5,min(40.0,float(self.param('Maxrate',10))))
+        if self.tokens+(now-self.token_time)*rate<1.0:
+            return
+        on=self.c.par.On.eval()
         pixels=None
-        if self.c.par.On.eval():
+        if on:
             top=self.c.op('rgba')
             if not self.c.inputs or top.height!=1:
                 self.error('Connect an N x 1 RGBA TOP before enabling output')
@@ -375,43 +420,58 @@ class Controller:
             pixels=top.numpyArray(delayed=True)
             if pixels is None:
                 return
-        for offset in range(len(rows)):
-            idx=(self.cursor+offset)%len(rows)
-            row=rows[idx]
+        duration=round(self.c.par.Transition.eval()*1000)
+        min_gap=float(self.param('Interval',0.1))
+        refresh=float(self.param('Refresh',2))
+        best=None
+        stale=None
+        for row in rows:
             lid=mapping[row,1].val
             if lid not in self.lights:
                 self.error('Mapping contains an unknown light ID')
                 continue
-            if not self.light_ready_for_send(lid,now):
-                continue
-            if not self.control_ready(lid):
+            if not self.light_ready_for_send(lid,now) or not self.control_ready(lid):
                 continue
             try:
-                if not self.c.par.On.eval():
-                    body={'on':{'on':False},'dynamics':{'duration':round(self.c.par.Transition.eval()*1000)}}
-                else:
+                light=self.lights[lid]
+                if on:
                     pixel=int(mapping[row,0].val)
                     if pixel<0 or pixel>=pixels.shape[1]:
                         raise ValueError('Mapping pixel index outside TOP width')
-                    l=self.lights[lid]
-                    body=self.core.color_body(pixels[0,pixel],self.c.par.Transition.eval(),self.c.par.Colorspace.eval()=='linear',l.get('color',{}).get('gamut'))
-                    if 'color' not in l:
-                        body.pop('color',None)
-                    if 'dimming' not in l:
-                        body.pop('dimming',None)
-                    body['on']={'on':True}
-                if not self.should_send(lid,body,now):
-                    continue
-                self.last_send[lid]=now
-                self.cursor=(idx+1)%len(rows)
-                self.submit_control(lid,body)
+                    color=self.core.color_body(pixels[0,pixel],0,self.c.par.Colorspace.eval()=='linear',light.get('color',{}).get('gamut'))
+                    want=self.core.desired_state(color,light)
+                else:
+                    want=self.core.desired_state({},light,on=False)
+                prev=self.sent.get(lid)
+                age=now-self.last_send.get(lid,-1e9)
+                body,score,new_state=self.core.state_command(prev,want,duration)
+                if body is not None:
+                    power='on' in body
+                    if not power and age<min_gap:
+                        continue
+                    rank=score*(1+min(age,10))
+                    if best is None or rank>best[0]:
+                        best=(rank,lid,body,new_state)
+                elif refresh>0 and age>=refresh and (stale is None or age>stale[0]):
+                    # Unchanged lights are re-sent only with spare budget, to heal a
+                    # command the Bridge may have dropped.
+                    body,_,new_state=self.core.state_command(prev,want,duration,refresh=True)
+                    stale=(age,lid,body,new_state)
             except Exception as e:
                 self.error(str(e))
+        choice=best or stale
+        if choice is None or not self.take_token(now):
+            return
+        _,lid,body,new_state=choice
+        self.last_send[lid]=now
+        self.submit_control(lid,body,new_state)
 
     def close(self):
         self.pool.shutdown(wait=False,cancel_futures=True)
         self.control_pool.shutdown(wait=False,cancel_futures=True)
         self.discovery_pool.shutdown(wait=False,cancel_futures=True)
+        self.client.close()
+        self.control_client.close()
 
     def bridge_ip(self):
         value=self.c.par.Bridgeip.eval().strip()

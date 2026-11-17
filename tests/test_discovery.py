@@ -3,7 +3,7 @@ import struct
 import unittest
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'))
-import discovery
+import ent_core as discovery
 
 def name(s):
     return b''.join(bytes([len(x)])+x.encode() for x in s.split('.'))+b'\0'
@@ -26,7 +26,8 @@ class DiscoveryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             discovery.read_name(b'\xc0\x00',0)
     def test_discovery_uses_only_mdns(self):
-        source=(Path(__file__).resolve().parents[1]/'src/discovery.py').read_text(encoding='utf-8')
+        # Discovery lives in ent_core: mDNS only, no cloud lookup.
+        source=(Path(__file__).resolve().parents[1]/'src/ent_core.py').read_text(encoding='utf-8')
         self.assertNotIn('discovery.meethue.com',source)
         self.assertNotIn('urlopen',source)
     def test_no_hue_service_does_not_select_unrelated_device(self):

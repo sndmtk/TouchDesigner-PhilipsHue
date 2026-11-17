@@ -12,6 +12,14 @@ LAYOUT={
     'lights':(-600,-500), 'out_lights':(-350,-500),
 }
 
+# Light output tuning: (name, label, default, min, max). Keep in sync with update_component.py.
+OUTPUT_PARS=[
+    ('Maxrate','Max Commands/s',10,1,40),
+    ('Interval','Min Interval per Light (s)',0.1,0,None),
+    ('Refresh','Refresh Unchanged (s)',2,0,None),
+    ('Transition','Transition (s)',1,0,None),
+]
+
 def apply_layout(component):
     for name,(x,y) in LAYOUT.items():
         child=component.op(name)
@@ -53,11 +61,14 @@ def build():
     p=page.appendToggle('On',label='Lights On')[0]
     p.default=True
     p.val=True
-    for name,label,value in [('Interval','Update Interval (s)',1),('Transition','Transition (s)',1)]:
+    for name,label,value,lo,hi in OUTPUT_PARS:
         p=page.appendFloat(name,label=label)[0]
         p.default=value
-        p.min=.1 if name=='Interval' else 0
+        p.min=lo
         p.clampMin=True
+        if hi is not None:
+            p.max=hi
+            p.clampMax=True
         p.val=value
     p=page.appendMenu('Colorspace',label='Input Color Space')[0]
     p.menuNames=['srgb','linear']
