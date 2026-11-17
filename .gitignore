@@ -2,4 +2,3 @@ __pycache__/
 build/
 Backup/
 *.toe.bak
-HueBridge_paired.tox
