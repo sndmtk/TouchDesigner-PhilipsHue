@@ -1313,3 +1313,30 @@ class ExtensionTests(ControllerBase):
             self.ext.SelectArea('Nope')
         with self.assertRaises(ValueError):
             self.ext.CreateArea('X', ['Nope'])
+
+
+class StartupTests(ControllerBase):
+    def test_saved_toe_reconnects_and_streams_without_user_action(self):
+        """Next day: keys, area and Enable Streaming saved in the TOE -> all automatic."""
+        self.paired()
+        self.c.par.Stream.val = True
+        self.c.par.Area.val = AREA_ID
+        self.ctrl.config = None
+        cfg, ent, dev = area_resources(2)
+        data = {'entertainment_configuration': cfg, 'entertainment': ent, 'device': dev,
+                'zigbee_connectivity': [], 'light': [{'id': 'light-0', 'on': {'on': False}}]}
+        kinds = []
+
+        def submit(kind, method, path, body=None, extra=None):
+            kinds.append(kind)
+            f = Future()
+            f.set_result((200, {'errors': [], 'data': data.get(kind, [])}))
+            self.ctrl.pending = (f, kind, (self.ctrl.config, self.ctrl.generation), extra)
+        self.ctrl.submit = submit
+        for _ in range(10):
+            self.ctrl.tick()
+            if kinds and kinds[-1] == 'start':
+                break
+        self.assertEqual(kinds, list(ent_runtime.FETCHES) + ['start'])
+        self.assertTrue(self.light_rows()['Lamp 0'].startswith('off'))
+        self.ctrl.pending = None

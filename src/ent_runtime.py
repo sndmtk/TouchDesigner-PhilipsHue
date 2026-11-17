@@ -1120,9 +1120,9 @@ class Controller:
                 return
         # Lists and Zigbee status every 10 s, also while streaming (one small GET each).
         if not self.ready or self.areas_dirty or now - self.last_area_poll >= 10:
-            self.fetch_queue = ['entertainment', 'device', 'zigbee_connectivity']
+            self.fetch_queue = list(FETCHES[1:])
             self.last_area_poll = now
-            self.submit('entertainment_configuration', 'GET', '/clip/v2/resource/entertainment_configuration')
+            self.submit(FETCHES[0], 'GET', '/clip/v2/resource/' + FETCHES[0])
             return
         if want and self.sender is None and not self.starting and now >= self.retry_at:
             self.starting = True
