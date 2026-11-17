@@ -10,7 +10,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 
-FETCHES = ('entertainment_configuration', 'entertainment', 'device', 'zigbee_connectivity')
+FETCHES = ('entertainment_configuration', 'entertainment', 'device', 'zigbee_connectivity', 'light')
 MANAGEMENT = ('create_area', 'update_area', 'delete_area', 'delete_device', 'search_resources', 'search_start')
 FAILED = {
     'create_area': 'Could not create the area: see errors DAT',
@@ -282,9 +282,7 @@ class Controller:
         self.lights_signature = None
         self.area_event = None          # ('onAreaCreated' | 'onAreaUpdated', area id) fired after the refresh
         self.stream_info = None
-        self.power_seen = None          # Lights On value last acted on (None: not yet connected)
-        self.power_queue = []           # light service ids waiting for an on/off request
-        self.power_on = True
+        self.power_queue = []           # (light name, light rid, on) waiting to be sent
         self.power_next = 0
         self.smooth = {}        # channel_id -> (r, g, b, bri) last sent, linear light
         self.smooth_area = None
@@ -454,7 +452,7 @@ class Controller:
             self.status('areas', 'Deleting area "%s"...' % area['name'])
 
     # ------------------------------------------------------------ light management
-    def light_command(self, name, confirmed):
+    def light_command(self, name, confirmed, device_id=None):
         if not self.ready:
             self.error('Connect and pair with the Bridge first')
             return
@@ -467,7 +465,7 @@ class Controller:
             self.management = ('search_resources', 'GET', '/clip/v2/resource/zigbee_device_discovery', None, None)
             self.status('lights', 'Searching for new lights: power them on near the Bridge...')
         elif confirmed:
-            device = self.selected_device()
+            device = self.selected_device(device_id)
             if device is None:
                 self.error('Select a light in Device first')
                 return
@@ -478,8 +476,8 @@ class Controller:
             self.management = ('delete_device', 'DELETE', '/clip/v2/resource/device/' + device['id'], None, device['name'])
             self.status('lights', 'Deleting "%s" from the Bridge...' % device['name'])
 
-    def selected_device(self):
-        dev = self.c.par.Device.eval()
+    def selected_device(self, device_id=None):
+        dev = device_id or self.c.par.Device.eval()
         return next((d for d in self.ent.light_devices(self.raw.get('device', [])) if d['id'] == dev), None)
 
     def device_areas(self, device_id):
@@ -570,7 +568,7 @@ class Controller:
                 p.destroy()
             lights.appendPulse('Searchlights', label='Search New Lights')
             p = lights.appendStr('Lightinfo', label='Registered Lights')[0]
-            p.val = '%d light(s): Zigbee status | area pixel' % len(cands)
+            p.val = '%d light(s): on/off | Zigbee status | area pixel' % len(cands)
             p.readOnly = True
             p.startSection = True
             for i, c in enumerate(cands):
@@ -607,7 +605,9 @@ class Controller:
             p = getattr(self.c.par, 'Light%d' % (i + 1), None)
             if p is None:
                 continue
-            text = self.light_status(c) or 'status unknown'
+            on = self.bridge_power().get(self.light_rid(c))
+            text = ('on' if on else 'off') + ' | ' if on is not None else ''
+            text += self.light_status(c) or 'status unknown'
             if c['id'] in pixel_of:
                 text += ' | in area, pixel ' + str(pixel_of[c['id']])
             if p.eval() != text:
@@ -642,46 +642,51 @@ class Controller:
         self.stream_announced = False
         self.stream_info = None
         if info is not None:
-            # Released lights go back to their state before streaming; keep them off if asked.
-            if not self.par_value('Lightson', True):
-                self.queue_power(False)
             self.fire('onStreamStop', info, reason)
 
-    # ------------------------------------------------------------ Lights On
-    def power_targets(self):
-        """Light service ids for Lights On: the selected area's lights, or every
-        light on the Bridge when no area is selected."""
-        owners = {e['id']: e.get('owner', {}).get('rid') for e in self.raw.get('entertainment', [])}
-        area = self.selected_area()
-        if area is not None:
-            devices = {owners.get(sid) for ch in area['channels'] for sid in ch['services']}
-        else:
-            devices = {c['device'] for c in self.candidates()}
-        out = []
+    # ------------------------------------------------------------ per-light on/off (Lights page)
+    def light_rid(self, cand):
+        """The light resource (on/off over HTTPS) of a candidate's device."""
         for d in self.raw.get('device', []):
-            if d['id'] in devices:
-                out += [s['rid'] for s in d.get('services', []) if s.get('rtype') == 'light']
-        return sorted(set(out))
+            if d['id'] == cand['device']:
+                for svc in d.get('services', []):
+                    if svc.get('rtype') == 'light':
+                        return svc['rid']
+        return None
 
-    def queue_power(self, on):
-        self.power_on = bool(on)
-        self.power_queue = self.power_targets()
-        if self.power_queue:
-            self.status('lights', 'Turning %d light(s) %s' % (len(self.power_queue), 'on' if on else 'off'))
+    def bridge_power(self):
+        """{light rid: on} from the last 'light' fetch."""
+        return {l['id']: bool(l.get('on', {}).get('on')) for l in self.raw.get('light', [])}
 
-    def check_power(self):
-        """Lights On while not streaming: switch the lights over HTTPS when the
-        toggle changes (not on connect, so lights are left as they are)."""
-        value = bool(self.par_value('Lightson', True))
-        if self.power_seen is None:
-            self.power_seen = value
-            return
-        if value == self.power_seen:
-            return
-        self.power_seen = value
-        if self.sender is None and not self.starting and not self.stream_area:
-            self.queue_power(value)
-        # While streaming, frame() sends black instead.
+    def find_light(self, ref):
+        """A light by name, entertainment service id, or 1-based index on the Lights page."""
+        cands = self.candidates()
+        if isinstance(ref, int) and not isinstance(ref, bool):
+            return cands[ref - 1] if 1 <= ref <= len(cands) else None
+        return next((c for c in cands if c['id'] == ref), None) or \
+            next((c for c in cands if c['name'] == ref), None) or \
+            next((c for c in cands if c['name'].lower() == str(ref).lower()), None)
+
+    def set_power(self, refs, on):
+        """Switch lights on or off over HTTPS (refs: a light, a list, or None for all).
+        Sent whatever the current state is. Lights of a streaming area ignore it
+        (the stream owns them). Returns the names that were queued."""
+        cands = self.candidates() if refs is None else \
+            [self.find_light(r) for r in (refs if isinstance(refs, (list, tuple, set)) else [refs])]
+        names = []
+        for ref, cand in zip(refs if isinstance(refs, (list, tuple, set)) else [refs] * len(cands), cands):
+            rid = self.light_rid(cand) if cand else None
+            if rid is None:
+                self.error('Unknown light: %s' % (ref if cand is None else cand['name']))
+                continue
+            self.power_queue = [q for q in self.power_queue if q[1] != rid] + [(cand['name'], rid, bool(on))]
+            names.append(cand['name'])
+        if names:
+            streaming = {sid for a in self.areas if a['id'] == self.stream_area for ch in a['channels'] for sid in ch['services']}
+            busy = [c['name'] for c in cands if c and c['id'] in streaming]
+            self.status('lights', 'Switching %s %s%s' % (', '.join(names), 'on' if on else 'off',
+                                                       ' (streaming lights ignore it: %s)' % ', '.join(busy) if busy else ''))
+        return names
 
     def frame(self, area, now=None):
         """Build one HueStream packet from the input TOP (TD thread).
@@ -691,7 +696,7 @@ class Controller:
         now = time.monotonic() if now is None else now
         mapping = self.mapping_dat()
         linear = self.c.par.Colorspace.eval() == 'linear'
-        lights_on = bool(self.par_value('Lightson', True))
+        rgb = self.par_value('Colorformat', 'xy') == 'rgb'
         mode = self.c.par.Brightness.eval()
         smoothing = float(self.par_value('Smoothing', 0.0))
         if self.smooth_area != area['id']:
@@ -716,8 +721,8 @@ class Controller:
             if channel not in valid:
                 self.error('Mapping contains a channel that is not in this area: ' + str(channel))
                 continue
-            if pixels is None or not lights_on:
-                target = (0.0, 0.0, 0.0, 0.0)  # no input, or Lights On off: fade to black
+            if pixels is None:
+                target = (0.0, 0.0, 0.0, 0.0)  # no input: fade to black
             elif pixel < 0 or pixel >= pixels.shape[1]:
                 self.error('Mapping pixel index outside TOP width: ' + str(pixel))
                 continue
@@ -725,8 +730,9 @@ class Controller:
                 target = self.ent.rgba_to_linear(pixels[0, pixel], linear, mode)
             value = self.ent.smooth_step(self.smooth.get(channel), target, dt, smoothing)
             self.smooth[channel] = value
-            channels.append((channel,) + tuple(self.ent.linear_to_xyb(*value)))
-        return self.ent.packet(area['id'], channels)
+            convert = self.ent.linear_to_rgb if rgb else self.ent.linear_to_xyb
+            channels.append((channel,) + tuple(convert(*value)))
+        return self.ent.packet(area['id'], channels, self.ent.COLOR_RGB if rgb else self.ent.COLOR_XY)
 
     def par_value(self, name, default):
         # Components built before a parameter existed keep working with its default.
@@ -889,10 +895,12 @@ class Controller:
                 self.auth_stopped = True
                 raise ValueError('API key rejected. Use Forget Key to pair again.')
             if kind == 'power':
+                name, on = extra
                 if not isinstance(result, dict) or code >= 400 or result.get('errors'):
-                    raise ValueError('Lights On: ' + str(result.get('errors') if isinstance(result, dict) else result))
+                    raise ValueError('Could not switch "%s": %s' % (name, result.get('errors') if isinstance(result, dict) else result))
+                self.status('lights', 'Switched "%s" %s' % (name, 'on' if on else 'off'))
                 if not self.power_queue:
-                    self.status('lights', 'All lights %s' % ('on' if self.power_on else 'off'))
+                    self.areas_dirty = True   # read the light list again so the rows show the new state
                 return True
             if kind == 'stop':
                 return True  # best effort; the Bridge also stops on its own after a timeout
@@ -1045,7 +1053,6 @@ class Controller:
         self.watch_sender(now)
         if self.ready:
             self.check_mapping_edits(now)
-            self.check_power()
 
         area = self.selected_area()
         want = bool(self.c.par.Stream.eval()) and self.ready and area is not None
@@ -1090,9 +1097,9 @@ class Controller:
             self.submit('stop', 'PUT', '/clip/v2/resource/entertainment_configuration/' + area_id, {'action': 'stop'})
             return
         if self.power_queue and now >= self.power_next:
-            rid = self.power_queue.pop(0)
+            name, rid, on = self.power_queue.pop(0)
             self.power_next = now + 0.1   # about 10 light commands per second, as Hue recommends
-            self.submit('power', 'PUT', '/clip/v2/resource/light/' + rid, {'on': {'on': self.power_on}})
+            self.submit('power', 'PUT', '/clip/v2/resource/light/' + rid, {'on': {'on': on}}, extra=(name, on))
             return
         if self.management is not None and not self.management_inflight:
             kind, method, path, body, label = self.management
@@ -1123,19 +1130,32 @@ class Controller:
                         {'action': 'start'}, extra=area['id'])
 
     def close(self):
-        """Stop streaming and release the area so lights return to normal control."""
-        area = self.stream_area
-        if self.sender is not None:
-            self.sender.stop()
-            self.sender.join(timeout=0.5)
-            self.sender = None
-        if area and self.config and self.config[0]:
-            try:
-                key = self.credentials(self.config[0])[0]
-                self.ent.Client(timeout=2).request(self.config[0], key, 'PUT',
-                    '/clip/v2/resource/entertainment_configuration/' + area, {'action': 'stop'}, True)
-            except Exception:
-                pass
-        self.pool.shutdown(wait=False, cancel_futures=True)
+        """Stop streaming and release the area so lights return to normal control.
+
+        Runs on TouchDesigner's thread (exit, rebuild), so nothing here waits: the
+        sender is told to stop, and releasing the area and closing the HTTPS
+        connection happen on a short-lived background thread."""
+        area, sender = self.stream_area, self.sender
+        self.sender = None
+        if sender is not None:
+            sender.stop()
+        host = self.config[0] if self.config else ''
+        key = self.credentials(host)[0] if host else ''
+        pool, client, ent = self.pool, self.client, self.ent
         self.discovery_pool.shutdown(wait=False, cancel_futures=True)
-        self.client.close()
+        pool.shutdown(wait=False, cancel_futures=True)
+
+        def release():
+            if sender is not None:
+                sender.join(timeout=1.0)
+            if area and host and key:
+                try:
+                    ent.Client(timeout=2).request(host, key, 'PUT',
+                        '/clip/v2/resource/entertainment_configuration/' + area, {'action': 'stop'}, True)
+                except Exception:
+                    pass
+            pool.shutdown(wait=True)   # let a request in flight finish before closing its socket
+            client.close()
+
+        # Not a daemon: on exit Python lets it finish (at most ~3 s) so the area is released.
+        threading.Thread(target=release, name='HueRelease').start()

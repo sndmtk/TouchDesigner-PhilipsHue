@@ -16,7 +16,7 @@ import traceback
 
 ROOT = Path(r'C:/Users/sndmt/Documents/Github Projects/TouchDesigner-PhilipsHue')
 NAME = 'HueEntertainment'
-MODULES = ('dtls_psk', 'ent_core', 'ent_runtime')
+MODULES = ('dtls_psk', 'ent_core', 'ent_runtime', 'ent_ext')
 TABLES = {
     'mapping': ['pixel', 'channel_id', 'name', 'light_key'],
 }
@@ -29,6 +29,7 @@ LAYOUT = {
     'rgba': (-600, 300), 'README': (-350, 300), 'errors': (-100, 300),
     'dtls_psk': (-600, 100), 'ent_core': (-350, 100), 'ent_runtime': (-100, 100),
     'lifecycle': (-600, -100), 'controls': (-350, -100), 'mapping': (-100, -100),
+    'ent_ext': (150, 100),
 }
 LIFECYCLE = '''controller = None
 def get_controller():
@@ -82,7 +83,7 @@ def snapshot(c):
     values = {}
     for p in getattr(c, 'customPars', []):
         # Pulses carry no value; Status and the per-light rows are rebuilt by the runtime.
-        if p.style not in ('Pulse', 'Header') and p.name != 'Status' and not p.name.startswith(('Light', 'Use', 'Pos')):
+        if p.style not in ('Pulse', 'Header') and p.name != 'Status' and not p.name.startswith(('Light', 'Power', 'Use', 'Pos')):
             # OP/DAT parameters keep their path text, not the operator.
             values[p.name] = p.val if p.style in ('OP', 'DAT', 'COMP', 'TOP', 'CHOP', 'SOP') else p.eval()
     return values
@@ -156,11 +157,11 @@ def build_pars(c):
 
     pg = page(c, 'Stream')
     ensure_par(c, pg, 'Toggle', 'Stream', 'Enable Streaming')
-    ensure_par(c, pg, 'Toggle', 'Lightson', 'Lights On', default=True)
     ensure_par(c, pg, 'Float', 'Fps', 'Send Rate (fps)', default=50, min=10, max=60, normMin=10, normMax=60,
                clampMin=True, clampMax=True)
     ensure_par(c, pg, 'Float', 'Smoothing', 'Smoothing (s)', default=0, min=0, max=5, normMin=0, normMax=2,
                clampMin=True, clampMax=False)
+    menu(c, pg, 'Menu', 'Colorformat', 'Stream Color Format', ['xy', 'rgb'], ['XY + Brightness', 'RGB'], 'xy')
     menu(c, pg, 'Menu', 'Colorspace', 'Input Color Space', ['srgb', 'linear'], ['sRGB', 'Linear sRGB'], 'srgb')
     menu(c, pg, 'Menu', 'Brightness', 'Brightness From', ['value', 'alpha'], ['Alpha x RGB Value', 'Alpha Only'], 'value')
 
@@ -183,6 +184,27 @@ def restore(c, values):
             p.val = value
         except Exception:
             pass
+
+
+EXTENSION = "op('./ent_ext').module.HueEntertainmentExt(me)"
+
+
+def setup_extension(c, report):
+    """Promoted extension: op('HueEntertainment').LightOff('Hue Go') etc."""
+    # Parameter names of the first extension slot (current TouchDesigner, then older builds).
+    for obj, name, promote in (('extension1', 'extname1', 'promoteextension1'), ('ext0object', 'ext0name', 'ext0promote')):
+        if getattr(c.par, obj, None) is not None:
+            getattr(c.par, obj).val = EXTENSION
+            getattr(c.par, name).val = 'HueEntertainmentExt'
+            getattr(c.par, promote).val = True
+            break
+    else:
+        report['extension_error'] = 'no extension parameters found'
+        return
+    try:
+        c.initializeExtensions()
+    except Exception as e:
+        report['extension_error'] = repr(e)
 
 
 def populate(c, report=None, docked=True):
@@ -219,6 +241,7 @@ def populate(c, report=None, docked=True):
     # The component's node viewer shows the error log (no DAT outputs).
     c.par.opviewer.expr = "me.op('errors')"
     c.viewer = True
+    setup_extension(c, report)
     o = c.op('README') or c.create(textDAT, 'README')
     o.text = (ROOT / 'README.md').read_text(encoding='utf-8')
     life = c.op('lifecycle') or c.create(executeDAT, 'lifecycle')

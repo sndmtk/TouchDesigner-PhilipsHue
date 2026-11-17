@@ -79,6 +79,19 @@ def linear_to_xyb(r, g, b, bri):
     return x, y, bri
 
 
+def linear_to_rgb(r, g, b, bri):
+    """Linear RGB + brightness -> (R, G, B) for the RGB stream format.
+
+    The colour is normalised (brightest component = 1), sRGB-encoded like the
+    values in a TOP, then scaled by brightness, so black is (0, 0, 0) and the
+    Bridge maps the colour into each light's gamut."""
+    peak = max(r, g, b)
+    if peak <= 1e-12:
+        return 0.0, 0.0, 0.0
+    enc = [12.92 * c if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055 for c in (r / peak, g / peak, b / peak)]
+    return tuple(max(0.0, min(1.0, c)) * bri for c in enc)
+
+
 def rgba_to_xyb(rgba, linear=False, brightness='value'):
     """Convert one RGBA pixel (0..1) to (x, y, brightness 0..1)."""
     return linear_to_xyb(*rgba_to_linear(rgba, linear, brightness))

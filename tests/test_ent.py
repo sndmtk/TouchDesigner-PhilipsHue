@@ -138,7 +138,7 @@ class Component:
         'Bridge': dict(Bridgeip='192.0.2.5', Apikey='', Clientkey='', Keyhost='', Status=''),
         'Area': dict(Area='none', Newareaname='TD'),
         'Lights': dict(Device='none'),
-        'Stream': dict(Stream=False, Lightson=True, Fps=50, Colorspace='srgb', Brightness='value', Smoothing=0.0),
+        'Stream': dict(Stream=False, Fps=50, Colorspace='srgb', Brightness='value', Smoothing=0.0),
     }
 
     def __init__(self):
@@ -246,6 +246,9 @@ class ControllerBase(unittest.TestCase):
         self.c = Component()
         self.ctrl = ent_runtime.Controller(self.c)
         self.ctrl.config = ('192.0.2.5', True)
+        self.fetch_time = 100.5
+
+    fetch_time = 100.5
 
     def tearDown(self):
         self.ctrl.close()
@@ -261,12 +264,14 @@ class ControllerBase(unittest.TestCase):
         self.c.par.Clientkey.val = '00112233445566778899aabbccddeeff'
         self.c.par.Keyhost.val = '192.0.2.5'
 
-    def load_areas(self, n=2, resources=None, zigbee=None):
+    def load_areas(self, n=2, resources=None, zigbee=None, on=None):
         cfg, ent, dev = resources or area_resources(n)
         if zigbee is None:
             zigbee = [{'owner': {'rid': d['id']}, 'status': 'connected'} for d in dev]
+        lights = [{'id': s['rid'], 'owner': {'rid': d['id']}, 'on': {'on': (on or {}).get(s['rid'], True)}}
+                  for d in dev for s in d.get('services', []) if s['rtype'] == 'light']
         steps = [('entertainment_configuration', cfg), ('entertainment', ent), ('device', dev),
-                 ('zigbee_connectivity', zigbee)]
+                 ('zigbee_connectivity', zigbee), ('light', lights)]
         for i, (kind, data) in enumerate(steps):
             self.ctrl.fetch_queue = [k for k, _ in steps[i + 1:]]
             self.respond(kind, {'errors': [], 'data': data})
@@ -763,15 +768,15 @@ class LightManagementTests(ControllerBase):
         self.load_areas(2, zigbee=zig)
         self.assertEqual(self.c.page_pars('Lights'),
                          ['Searchlights', 'Lightinfo', 'Light1', 'Light2', 'Device', 'Deletedevice'])
-        self.assertEqual(self.light_rows(), {'Lamp 0': 'connected | in area, pixel 0',
-                                             'Lamp 1': 'connectivity_issue | in area, pixel 1'})
+        self.assertEqual(self.light_rows(), {'Lamp 0': 'on | connected | in area, pixel 0',
+                                             'Lamp 1': 'on | connectivity_issue | in area, pixel 1'})
         self.assertIn('Lamp 1', self.c.tables['errors'].rows[-1][1])
 
     def test_light_list_follows_pixel_edits(self):
         self.load_areas(2)
         self.c.tables['mapping'][1, 0] = 5             # move Lamp 0 to the end
         self.ctrl.check_mapping_edits(time.monotonic() + 1)
-        self.assertEqual(self.light_rows()['Lamp 0'], 'connected | in area, pixel 1')
+        self.assertEqual(self.light_rows()['Lamp 0'], 'on | connected | in area, pixel 1')
 
     def test_status_updates_without_losing_toggle_edits(self):
         self.load_areas(2)
@@ -779,7 +784,7 @@ class LightManagementTests(ControllerBase):
         zig = [{'owner': {'rid': 'dev-0'}, 'status': 'disconnected'}, {'owner': {'rid': 'dev-1'}, 'status': 'connected'}]
         self.load_areas(2, zigbee=zig)
         self.assertFalse(self.use()['Lamp 0'])
-        self.assertTrue(self.light_rows()['Lamp 0'].startswith('disconnected'))
+        self.assertTrue(self.light_rows()['Lamp 0'].startswith('on | disconnected'))
 
     def test_device_selection_survives_light_list_rebuild(self):
         self.load_areas(2)
@@ -1142,53 +1147,169 @@ class CallbackTests(ControllerBase):
         self.assertEqual(self.c.par.Callbacksdat.val, '../HueEntertainment_callbacks')
 
 
-class LightsOnTests(ControllerBase):
-    def test_streaming_off_sends_black_regardless_of_top(self):
-        self.paired()
-        self.load_areas(2)
-        area = self.ctrl.selected_area()
-        on = self.ctrl.frame(area, now=1)
-        self.c.par.Lightson.val = False
-        off = self.ctrl.frame(area, now=2)
-        bri = lambda p, i: int.from_bytes(p[52 + 7 * i + 5:52 + 7 * i + 7], 'big')
-        self.assertGreater(bri(on, 0), 0)
-        self.assertEqual((bri(off, 0), bri(off, 1)), (0, 0))
-
-    def test_toggle_switches_area_lights_over_https_when_not_streaming(self):
-        self.paired()
-        self.load_areas(2)
-        self.ctrl.tick()
-        self.ctrl.pending = None
-        self.assertEqual(self.ctrl.power_queue, [])    # nothing is switched on connect
-        self.c.par.Lightson.val = False
+class LightPowerTests(ControllerBase):
+    def capture(self):
         sent = []
-        self.ctrl.submit = lambda kind, method, path, body=None, extra=None: sent.append((kind, method, path, body))
-        for _ in range(3):
+        self.ctrl.submit = lambda kind, method, path, body=None, extra=None: sent.append((kind, method, path, body, extra))
+        return sent
+
+    def run_ticks(self, n=3):
+        for _ in range(n):
             self.ctrl.power_next = 0
             self.ctrl.tick()
-        self.assertEqual(sent, [('power', 'PUT', '/clip/v2/resource/light/light-%d' % i, {'on': {'on': False}}) for i in (0, 1)])
 
-    def test_without_area_all_lights_are_switched(self):
+    def test_row_shows_bridge_on_off_state(self):
+        self.paired()
+        self.load_areas(2, on={'light-1': False})
+        self.assertTrue(self.light_rows()['Lamp 1'].startswith('off | connected'))
+
+    def test_on_and_off_are_sent_whatever_the_shown_state(self):
+        self.paired()
+        self.load_areas(2)              # both shown as on
+        sent = self.capture()
+        self.ctrl.set_power('Lamp 1', True)     # on again: still sent
+        self.ctrl.set_power(1, False)
+        self.run_ticks()
+        self.assertEqual(sent, [
+            ('power', 'PUT', '/clip/v2/resource/light/light-1', {'on': {'on': True}}, ('Lamp 1', True)),
+            ('power', 'PUT', '/clip/v2/resource/light/light-0', {'on': {'on': False}}, ('Lamp 0', False))])
+
+    def test_latest_pulse_for_a_light_wins(self):
         self.paired()
         self.load_areas(2)
-        self.c.par.Area.val = 'none'
-        self.assertEqual(self.ctrl.power_targets(), ['light-0', 'light-1'])
+        self.ctrl.set_power('Lamp 0', False)
+        self.ctrl.set_power('lamp 0', True)
+        self.assertEqual(self.ctrl.power_queue, [('Lamp 0', 'light-0', True)])
 
-    def test_stream_stop_keeps_lights_off(self):
+    def test_success_rereads_lights_and_failure_is_reported(self):
         self.paired()
         self.load_areas(2)
-        self.c.par.Lightson.val = False
-        self.ctrl.sender = SimpleNamespace(stop=lambda: None)
-        self.ctrl.stream_area = AREA_ID
-        self.ctrl.stream_announced = True
-        self.ctrl.stream_info = {'id': AREA_ID, 'name': 'Stage', 'lights': []}
-        self.ctrl.stop_stream('disabled')
-        self.assertEqual(self.ctrl.power_queue, ['light-0', 'light-1'])
-        self.assertFalse(self.ctrl.power_on)
-
-    def test_power_error_is_reported_without_reconnecting(self):
-        self.paired()
-        self.load_areas(2)
-        self.respond('power', {'errors': [{'description': 'device unreachable'}], 'data': []})
+        self.ctrl.areas_dirty = False
+        self.respond('power', {'errors': [], 'data': []}, extra=('Lamp 0', False))
+        self.assertTrue(self.ctrl.areas_dirty)
+        self.assertIn('Switched "Lamp 0" off', self.state())
+        self.respond('power', {'errors': [{'description': 'device unreachable'}], 'data': []}, extra=('Lamp 0', True))
         self.assertTrue(self.ctrl.ready)
-        self.assertIn('Lights On', self.c.tables['errors'].rows[-1][1])
+        self.assertIn('Could not switch "Lamp 0"', self.c.tables['errors'].rows[-1][1])
+
+    def test_streaming_light_is_warned(self):
+        self.paired()
+        self.load_areas(2)
+        self.ctrl.stream_area = AREA_ID
+        self.ctrl.set_power(None, False)
+        self.assertIn('streaming lights ignore it: Lamp 0, Lamp 1', self.state())
+
+    def test_unknown_light_is_reported(self):
+        self.paired()
+        self.load_areas(2)
+        self.assertEqual(self.ctrl.set_power(['Lamp 0', 'Nope'], False), ['Lamp 0'])
+        self.assertIn('Unknown light: Nope', self.c.tables['errors'].rows[-1][1])
+
+
+class ColorFormatTests(ControllerBase):
+    def test_rgb_format_header_and_values(self):
+        self.paired()
+        self.load_areas(2)
+        self.c.par.Colorformat = par('rgb')
+        packet = self.ctrl.frame(self.ctrl.selected_area(), now=1)
+        self.assertEqual(packet[14], ent_core.COLOR_RGB)
+        values = lambda i: [int.from_bytes(packet[52 + 7 * i + 1 + 2 * k:52 + 7 * i + 3 + 2 * k], 'big') for k in range(3)]
+        self.assertEqual(values(0), [65535, 0, 0])       # red pixel
+        self.assertEqual(values(1), [0, 0, 65535])       # blue pixel
+
+    def test_xy_is_the_default(self):
+        self.paired()
+        self.load_areas(2)
+        self.assertEqual(self.ctrl.frame(self.ctrl.selected_area(), now=1)[14], ent_core.COLOR_XY)
+
+    def test_linear_to_rgb(self):
+        self.assertEqual(ent_core.linear_to_rgb(0, 0, 0, 1), (0.0, 0.0, 0.0))
+        r, g, b = ent_core.linear_to_rgb(0.2140, 0.2140, 0.2140, 0.5)   # mid grey, half brightness
+        self.assertAlmostEqual(r, 0.5)
+        r, g, b = ent_core.linear_to_rgb(1.0, 0.2140, 0.0, 1.0)         # sRGB (1, 0.5, 0)
+        self.assertAlmostEqual(g, 0.5, places=3)
+
+
+class CloseTests(ControllerBase):
+    def test_close_does_not_block_and_releases_area_in_background(self):
+        import threading
+        self.paired()
+        self.load_areas(2)
+        self.ctrl.stream_area = AREA_ID
+        calls = []
+        started = threading.Event()
+
+        class SlowClient:
+            def __init__(self, timeout=None):
+                pass
+
+            def request(self, *args):
+                started.wait(2)
+                calls.append(args[2:4])
+
+        self.ctrl.ent = SimpleNamespace(**{**{k: getattr(ent_core, k) for k in dir(ent_core) if not k.startswith('_')},
+                                           'Client': SlowClient})
+        t0 = time.monotonic()
+        self.ctrl.close()
+        self.assertLess(time.monotonic() - t0, 0.2)
+        started.set()
+        for th in threading.enumerate():
+            if th.name == 'HueRelease':
+                th.join(3)
+        self.assertEqual(calls, [('PUT', '/clip/v2/resource/entertainment_configuration/' + AREA_ID)])
+
+    def tearDown(self):
+        pass
+
+
+import ent_ext
+
+
+class ExtensionTests(ControllerBase):
+    def setUp(self):
+        super().setUp()
+        self.c.modules['lifecycle'] = SimpleNamespace(get_controller=lambda: self.ctrl)
+        self.ext = ent_ext.HueEntertainmentExt(self.c)
+        self.paired()
+        self.load_areas(2, on={'light-1': False})
+
+    def test_state(self):
+        self.assertTrue(self.ext.Ready)
+        self.assertFalse(self.ext.Streaming)
+        self.assertEqual(self.ext.Areas, [{'id': AREA_ID, 'name': 'Stage', 'lights': ['Lamp 0', 'Lamp 1']}])
+        self.assertEqual(self.ext.SelectedArea['name'], 'Stage')
+        self.assertEqual([(l['name'], l['on']) for l in self.ext.Lights], [('Lamp 0', True), ('Lamp 1', False)])
+        self.assertEqual([m['name'] for m in self.ext.Mapping], ['Lamp 0', 'Lamp 1'])
+
+    def test_light_on_off(self):
+        self.assertEqual(self.ext.LightOff(), ['Lamp 0', 'Lamp 1'])
+        self.assertEqual(self.ext.LightOn('Lamp 1'), ['Lamp 1'])
+        self.assertEqual(self.ctrl.power_queue, [('Lamp 0', 'light-0', False), ('Lamp 1', 'light-1', True)])
+
+    def test_stream_and_color_format(self):
+        self.c.par.Colorformat = par('xy')
+        self.ext.StartStream('Stage')
+        self.assertTrue(self.c.par.Stream.val)
+        self.ext.SetColorFormat('rgb')
+        self.assertEqual(self.c.par.Colorformat.val, 'rgb')
+        self.ext.StopStream()
+        self.assertFalse(self.c.par.Stream.val)
+
+    def test_create_area_from_named_lights(self):
+        self.ext.CreateArea('Desk', ['Lamp 1'])
+        self.assertEqual(self.use(), {'Lamp 0': False, 'Lamp 1': True})
+        self.assertEqual(self.ctrl.management[0], 'create_area')
+        self.assertEqual(self.c.par.Newareaname.val, 'Desk')
+
+    def test_delete_light_and_area_without_dialog(self):
+        self.ext.DeleteLight('Lamp 1')
+        self.assertEqual(self.ctrl.management[:3], ('delete_device', 'DELETE', '/clip/v2/resource/device/dev-1'))
+        self.ctrl.management = None
+        self.ext.DeleteArea('Stage')
+        self.assertEqual(self.ctrl.management[0], 'delete_area')
+
+    def test_unknown_names_raise(self):
+        with self.assertRaises(ValueError):
+            self.ext.SelectArea('Nope')
+        with self.assertRaises(ValueError):
+            self.ext.CreateArea('X', ['Nope'])

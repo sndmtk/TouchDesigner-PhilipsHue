@@ -1,134 +1,236 @@
-# HueEntertainment（Entertainment API版）
+# TouchDesigner × Philips Hue (HueEntertainment)
 
-TouchDesignerのTOP画像から、Philips Hueのライトを**Entertainment API**でリアルタイムに制御するコンポーネントです。全ライト分の色を1つのパケットにまとめて毎秒最大60回送るため、HTTPS版（`HueBridge.tox`）と違って**ライト同士のずれがなく、更新も高速**です。
+A TouchDesigner component that drives Philips Hue lights in real time from a TOP, using the Hue **Entertainment API**. Each pixel of a one-row image is assigned to a light, and the colours of all lights are sent together in one packet up to 60 times per second, so **all lights change at the same moment** with low latency.
 
-`HueEntertainment.tox`をネットワークエディタにドラッグ＆ドロップして使います。追加のPythonパッケージは不要です（DTLS通信は標準ライブラリだけで実装しています）。
+Drag `HueEntertainment.tox` into a network to use it. No extra Python packages are needed: the DTLS encryption the Entertainment API requires is implemented with the Python standard library.
 
-## HTTPS版との違い
+Everything is done from the component's custom parameters: finding and pairing the Bridge, creating, updating and deleting Entertainment areas, adding new lights, removing lights, and checking their connection.
 
-| | HueBridge（HTTPS） | HueEntertainment |
+## Requirements
+
+- A Hue Bridge with the Hue API v2 (Entertainment)
+- Colour-capable Hue lights (up to 10 per Entertainment area)
+- A network where the PC can reach the Bridge over **HTTPS (TCP 443) and UDP port 2100**
+
+## Quick start
+
+1. On the **Bridge** page, press **Discover Bridges** or type the **Bridge IP**.
+2. Pairing starts automatically. When **Status** shows `Press the physical Bridge link button`, press the link button on the Bridge within 60 seconds. The **API Key** and **Client Key** (the stream encryption key) are stored on the component.
+3. The Entertainment areas are loaded. If there is exactly one, it is selected. Otherwise pick one in **Entertainment Area** on the **Area** page.
+   - **No area yet?** Under **Lights in Area** on the Area page, every light has a toggle and all of them start on. Turn off the lights you do not want and press **Create Area**. The new area is created and selected.
+4. Connect a **N × 1 RGBA TOP** to the input. The lights are ordered by name: pixel 0 drives the first light, pixel 1 the next, and so on.
+5. On the **Stream** page, turn on **Enable Streaming**. **Status** shows `Streaming N channel(s) at 50 fps`.
+6. **Save the TOE (Ctrl+S)** to keep the keys.
+
+Turning streaming off releases the area and the lights return to normal control. This also happens when TouchDesigner closes.
+
+The component's node viewer shows the error log, so problems are visible directly in the network.
+
+When the component is placed, a callbacks DAT `<name>_callbacks` is created below it and **docked** to it (it moves, copies and is deleted together with the component). It holds Python callbacks for events, like an Execute DAT (see [Callbacks](#callbacks)).
+
+## Parameters
+
+### Bridge
+
+| Parameter | Description |
+| --- | --- |
+| Bridge IP | IPv4 address of the Bridge. Discovered Bridges appear in the menu as `IP - Bridge ID` |
+| Discover Bridges | Searches the local network for Bridges (about 3 s). If exactly one is found and Bridge IP is empty, it is filled in |
+| Connect / Retry Pairing | Reconnects and restarts pairing |
+| Forget Key / Pair Again | Clears the stored keys and pairs again |
+| API Key / Client Key (PSK) / Authenticated Bridge IP | Values from pairing (read-only) |
+| Status | The current message: connection, pairing, area and light operations, streaming (read-only) |
+
+### Area
+
+| Parameter | Default | Description |
 | --- | --- | --- |
-| 送り方 | 1台ずつ順番に送信 | 全台を1パケットで同時に送信 |
-| フェード | Transition（Bridge側で補間） | Smoothing（コンポーネント内で補間）。初期値は0（なし） |
-| 更新頻度 | Bridge全体で毎秒約10件を台数で分け合う | 全台が毎秒最大60回（ライトへの反映は約25回/秒） |
-| ライト間のずれ | 台数÷送信レート秒 | なし |
-| 対象 | 登録済みの全ライト | Hueアプリで作ったEntertainmentエリアのライト（1エリア最大10台程度） |
-| 制限 | 部屋・ゾーン非対応 | ストリーミング中、エリア内のライトは他のアプリやHTTPS版から操作できません |
+| Entertainment Area | - | The area to stream to |
+| Refresh Areas | - | Reloads the areas and resets **Lights in Area** to the selected area |
+| New Area Name | TouchDesigner | Name used by Create Area |
+| Create Area | - | Creates a new area from the lights switched on under **Lights in Area** and selects it |
+| Update Selected Area | - | Replaces the lights of the selected area with **Lights in Area**. The area keeps its ID. If streaming, it stops, updates, and restarts by itself |
+| Delete Selected Area | - | After confirmation, deletes the selected area from the Bridge (the lights stay registered) |
+| Lights in Area | - | One toggle per light: on = in the area. Lights are placed by name, evenly from left (x = -1) to right (x = 1), so the name order is also the pixel order. The toggles show the selected area; your changes are kept until you select another area or press Refresh Areas. Lights newly added to the Bridge start switched on (they join the area when you press Update Selected Area). Without any area, all lights start on |
 
-## 必要なもの
+### Lights
 
-- Hue API v2（Entertainment）に対応したHue Bridge
-- **Entertainmentエリア**。このコンポーネントの**Create Area**で作成できます（Hueアプリの「設定 → エンタテイメントエリア」で作ったものも使えます）。カラー対応ライトのみ、1エリア最大10台
-- PCとBridgeの間で**UDPポート2100**が通ること
-
-## クイックスタート
-
-1. **Bridge**ページで**Discover Bridges**を押すか、**Bridge IP**を入力します。
-2. 自動でペアリングが始まります。`out_status`に`Press the physical Bridge link button`と出たら、60秒以内にBridgeのリンクボタンを押してください。
-   - Entertainment APIには通常のAPIキーに加えて**Client Key（暗号化の鍵）**が必要です。HueBridge.toxのAPIキーは使えないため、このコンポーネントで改めてペアリングします。
-3. 認証後、Entertainmentエリアの一覧を取得します。エリアが1つだけなら自動で選択されます。複数ある場合は**Stream**ページの**Entertainment Area**で選びます。
-   - **エリアがない場合は、ここで作成できます。** 内部の`area_lights` DATに、エリアに追加できるライトが一覧で表示されます。使うライトの`use`を`1`、使わないライトを`0`にし、`order`列の数字で左から右への並び順を決めてから、**Create Area from area_lights**を押してください。ライトは並び順どおりに左端（x=-1）から右端（x=1）へ等間隔に配置され、作成したエリアが自動で選択されます。
-4. **幅N×高さ1のRGBA TOP**を入力に接続します。`mapping` DATで、ピクセル番号とライトの対応を確認・編集できます。ピクセル番号は**常に0〜（ライトの数−1）の重複しない連番**です（詳しくは「mappingの採番」）。
-5. **Enable Streaming**をオンにします。`out_status`が`Streaming N channel(s) at 50 fps`になれば送信中です。
-6. **Ctrl+SでTOEを保存**し、キーを保持します。
-
-ストリーミングをオフにすると、エリアを解放してライトが通常の操作に戻ります。TouchDesignerを終了したときも自動で解放します。
-
-## パラメータ
-
-### Bridgeページ
-
-| パラメータ | 説明 |
+| Parameter | Description |
 | --- | --- |
-| Bridge IP | 接続先のIPv4アドレス |
-| Discover Bridges | ローカルネットワーク上のBridgeを検索（約3秒） |
-| Connect / Retry Pairing | 接続・ペアリングをやり直す |
-| Forget Key / Pair Again | 保存したキーを消去して再ペアリング |
-| API Key / Client Key (PSK) / Authenticated Bridge IP | ペアリングで取得した値（読み取り専用） |
+| Search New Lights | Registers new lights with the Bridge. Power the lights on first. New lights appear in the list below and, switched on, in **Lights in Area**. The search is followed for up to about 2 minutes |
+| Registered Lights | One read-only row per light on the Bridge: on/off (as last read from the Bridge), Zigbee status (`connected`, `connectivity_issue`, `disconnected`, ...) and, for lights in the selected area, its pixel. Refreshed about every 10 s. To switch lights on or off, use the extension (`LightOn` / `LightOff`, see [Python extension](#python-extension)) |
+| Device | The light to delete |
+| Delete Selected Device | After confirmation, removes the light from the Bridge. It also leaves its areas, and the pixels are renumbered. To use it again, search for it again |
 
-### Streamページ
+### Stream
 
-| パラメータ | 初期値 | 説明 |
+| Parameter | Default | Description |
 | --- | --- | --- |
-| Entertainment Area | — | ストリーミング先のエリア |
-| Refresh Areas | — | エリア一覧を再取得し、`area_lights`も作り直します（アプリでエリアを編集した後に押す） |
-| New Area Name | TouchDesigner | Create Areaで作るエリアの名前 |
-| Create Area from area_lights | — | `area_lights`で`use`=1のライトを`order`順に左から右へ並べたエリアを新しく作成し、選択します |
-| Update Selected Area from area_lights | — | 選択中のエリアのライトを`area_lights`の内容（`use`=1、`order`順）で置き換えます。エリアのIDは変わりません。ストリーミング中は停止してから更新し、Enable Streamingがオンなら自動で再開します |
-| Delete Selected Area | — | 確認画面のあと、選択中のエリアをBridgeから削除します（ライト自体は削除されません）。ストリーミング中なら先に停止します |
-| Enable Streaming | オフ | ストリーミングの開始・停止 |
-| Send Rate (fps) | 50 | 1秒あたりの送信回数（10〜60）。Bridgeからライトへは約25回/秒で反映され、UDPの取りこぼし対策として多めに送ります |
-| Smoothing (s) | 0 | 色・明るさの変化をなめらかにする時間（HTTPS版のTransitionに相当）。指定した秒数で変化の約95%に達します。補間はリニアな光の量で行うため、黒へのフェードでも色味を保ったまま暗くなります。0で無効（入力をそのまま送信）。TouchDesigner側ですでに補間している場合は0のままにしてください |
-| Input Color Space | sRGB | 入力TOPの色空間（sRGB / Linear sRGB） |
-| Brightness From | Alpha x RGB Value | 明るさの決め方。`Alpha x RGB Value`はRGBの最大値×Alphaで、暗いピクセルほど暗く光ります（映像向け）。`Alpha Only`はAlphaだけで明るさを決め、RGBは色だけに使います |
+| Enable Streaming | Off | Starts and stops streaming |
+| Send Rate (fps) | 50 | Packets per second (10-60). The Bridge updates the lights at about 25 Hz; sending more often covers lost UDP packets |
+| Smoothing (s) | 0 | Eases colour and brightness changes. About 95% of a change is reached after this many seconds. Blending is done in linear light, so fades to black keep their hue. 0 = off (send the input as is). Leave at 0 if the input is already smoothed in TouchDesigner |
+| Stream Color Format | XY + Brightness | How colours are sent. `XY + Brightness`: the component converts each pixel to a CIE xy colour and a brightness (Brightness From applies directly). `RGB`: 16-bit R, G, B (sRGB-encoded, scaled by brightness) and the Bridge converts them for each light. Compare both on your lights |
+| Input Color Space | sRGB | Colour space of the input TOP (sRGB / Linear sRGB) |
+| Brightness From | Alpha x RGB Value | `Alpha x RGB Value`: brightness is alpha times the largest of R, G, B, so darker pixels give dimmer lights (good for video). `Alpha Only`: alpha sets brightness and RGB only sets the colour |
 
-## 内部のDAT
+### Setup
 
-| DAT | 内容 |
+| Parameter | Description |
 | --- | --- |
-| out_status / status | 現在の状態メッセージ |
-| out_channels / channels | 選択中のエリアのチャンネル（ID・ライト名・位置）。グラデーションライトは区画ごとに`#番号`付きで並びます |
-| mapping | ピクセル→ライトの対応表（`pixel`、`channel_id`、`name`、`light_key`）。エリアの全ライトを必ず1回ずつ含み、`pixel`は常に0〜N−1の連番です |
-| area_lights | エリアに追加できるライト（`use`、`order`、名前、entertainmentサービスID）。選択中のエリアのライトが`use`=1で先頭に、その他が`use`=0で続きます。編集内容は定期更新で消えず、Bridgeに新しく登録されたライトは`use`=0で末尾に自動追加されます。Refresh Areasで初期状態に戻ります |
-| errors | 最新10件のエラー（キーは伏せ字） |
-| bridges | 検出したBridge |
+| Callbacks DAT | The DAT whose callback functions are called. Created once when the component is placed; if you delete it or clear this parameter, callbacks are off and it is not created again. Point it at another Text DAT to share callbacks |
+| Create Callbacks DAT | Creates a new docked callbacks DAT from the template and selects it |
 
-## mappingの採番
+## Inside the component
 
-`mapping`はエリア内の**全ライトを1行ずつ**持ち、`pixel`は**常に0〜（ライトの数−1）の重複しない連番**になるよう、自動で採番し直されます。
-
-- ライトは`light_key`（ライト固有のID）で識別します。Bridgeがエリアを編集してチャンネル番号を振り直しても、ピクセルは同じライトに対応したままです（`channel_id`列は自動で更新されます）。
-- **ライトがエリアから外れたとき**：その行を除いて採番し直します。残ったライトの並び順は保たれます。
-- **ライトがエリアに加わったとき**：末尾に追加して採番し直します。
-- **並び順を変えたいとき**：`pixel`の数字を書き換えます。たとえば`1.5`と入力すると1番と2番の間に移動し、すぐに0、1、2…へ採番し直されます。同じ番号が重なった場合は、表の上にある行が先になります。
-- **Create Area / Update Areaの後**は、`area_lights`で決めた左から右の順に作り直します。
-- ライトを制御対象から外したいときは、`mapping`の行を消すのではなく（消しても自動で戻ります）、Update Areaでエリアから外してください。
-
-## ライトを増やす・減らす
-
-| やりたいこと | 手順 |
+| Operator | Purpose |
 | --- | --- |
-| **新しいライトを追加する** | ①まずBridgeにライトを登録します。HueBridge.toxの**Search New Lights**か、Hueアプリの「ライトを追加」を使います。②登録されたライトは、約10秒以内（またはRefresh Areasを押したとき）に`area_lights`の末尾へ`use`=0で現れます。③`use`を1にし、`order`で位置を決めて**Update Selected Area**を押します |
-| **エリアからライトを外す** | `area_lights`でそのライトの`use`を0にし、**Update Selected Area**を押します。ライトはBridgeに登録されたまま残ります |
-| **Bridgeからライトを削除する** | HueBridge.toxの**Delete Selected Device**か、Hueアプリで削除します。エリアからは自動で外れ、`mapping`も採番し直されます |
-| **並び順を変える** | `area_lights`の`order`を変えてUpdate Selected Areaを押すか、`mapping`の`pixel`を書き換えます |
+| `rgba` (input TOP) | The N × 1 RGBA image |
+| `errors` | The last 10 errors (keys are redacted). Shown in the component's node viewer. Also reports when a light of the selected area loses its Zigbee connection |
+| `mapping` | Pixel to light table (`pixel`, `channel_id`, `name`, `light_key`). Maintained automatically; can be edited to change the pixel order (see below) |
+| `dtls_psk`, `ent_core`, `ent_runtime` | The code |
+| `ent_ext` | The Python extension (see [Python extension](#python-extension)) |
+| `lifecycle`, `controls` | Per-frame update and button callbacks |
+| `README` | This document |
 
-1エリアに入れられるのは10台までです。
+## Pixel numbering
 
-## うまく動かないとき
+`mapping` (inside the component) always holds **every light of the area exactly once**, and `pixel` is always **0 to (number of lights - 1), without gaps or duplicates**. It is renumbered automatically:
 
-| 症状 | 確認すること |
+- Lights are identified by `light_key` (a stable ID of the light). If the Bridge renumbers its channels, each pixel stays with the same light (`channel_id` is updated for you).
+- A light that leaves the area is removed and the rest are renumbered in their current order.
+- A light that joins the area is added at the end and everything is renumbered.
+- To reorder by hand, change a `pixel` value. For example `1.5` moves a light between 1 and 2, and the table is immediately renumbered 0, 1, 2, ... If two rows share a number, the upper row comes first.
+- When an area is selected, created or updated, the order is rebuilt from left to right (for areas made by this component: by light name).
+- Deleting a row has no lasting effect (it comes back). To stop controlling a light, switch it off under **Lights in Area** and press **Update Selected Area**.
+
+## Adding and removing lights
+
+| Task | Steps |
 | --- | --- |
-| `No Entertainment areas found` | `area_lights`を確認してCreate Areaを押すか、Hueアプリでエリアを作成してRefresh Areasを押す |
-| `area_lights`が空 | カラー対応ライトがBridgeに登録されているか確認し、Refresh Areasを押す |
-| `No light has use=1` | `area_lights`で使うライトの`use`を1にする |
-| `Could not create the area` / `Could not update the area` | `errors` DATの内容を確認。1エリアに追加できるのは10台までです |
-| `Could not start the area` | 他のアプリ（Hue Sync、別のTouchDesignerなど）が同じBridgeでストリーミング中でないか。Bridgeごとに同時に1エリアだけ使えます |
-| `Stream lost: Handshake timed out` | PCのファイアウォールでUDP 2100が止められていないか。Bridge IPが正しいか |
-| `Stream lost: No Finished from Bridge` | Client Keyが合っていない可能性があります。Forget Keyで再ペアリング |
-| 色が変わらないライトがある | `mapping`にそのチャンネルがあるか、入力TOPの幅がピクセル番号より大きいか |
-| HTTPS版と併用している | ストリーミング中、エリア内のライトにはHTTPS版の命令が効きません。HueBridgeのEnable Light Outputをオフにしてください |
+| **Add a new light** | Power the light on and press **Search New Lights**. It appears under **Lights in Area** already switched on; press **Update Selected Area** |
+| **Take a light out of the area** | Switch it off under **Lights in Area** and press **Update Selected Area**. It stays registered on the Bridge |
+| **Remove a light from the Bridge** | Select it in **Device** and press **Delete Selected Device** |
+| **Change the order** | The order follows the light names: rename lights in the Hue app, or edit `pixel` in `mapping` |
 
-## 保存と共有時の注意
+An area holds at most 10 lights.
 
-API KeyとClient Keyはカスタムパラメータに保存され、**TOEを保存するとキーも保存されます**。認証済みのTOEや、手動で書き出したTOXを公開しないでください。リポジトリの`HueEntertainment.tox`はビルダーが未ペアリングの状態で書き出したものです。
+## Python extension
 
-## 開発
+The component has a promoted extension, so its methods are called on the component itself:
 
-| ファイル | 役割 |
+```python
+hue = op('HueEntertainment')
+hue.LightOff('Hue Go')          # one light, a list, or nothing for all lights
+hue.StartStream('Stage')        # select an area and turn on Enable Streaming
+print(hue.Lights)
+```
+
+Lights are given by name (as on the Lights page, case-insensitive), entertainment service id, or 1-based index. Areas by name or id. Calls return immediately: Bridge requests run in the background and their results appear in Status, `errors` and the callbacks.
+
+| Member | Description |
 | --- | --- |
-| src/dtls_psk.py | DTLS 1.2クライアント（PSK、TLS_PSK_WITH_AES_128_GCM_SHA256のみ）。AES-128・GCM・TLS 1.2 PRFを標準ライブラリだけで実装 |
-| src/ent_core.py | HueStream v2パケット、RGB→xy変換、エリア情報の整理 |
-| src/ent_runtime.py | ペアリング、エリア取得、ストリームの開始・停止、送信スレッド |
-| src/build_entertainment.py | TouchDesigner内でコンポーネントを作成・更新し、未ペアリングのTOXを書き出す |
-| tests/test_ent.py | パケット・色・状態遷移のテスト。`openssl`コマンドがあれば実際のDTLSハンドシェイクも検証 |
+| `Status`, `Ready`, `Streaming` | Current Status message; paired and lists read; stream running |
+| `Areas`, `SelectedArea` | `[{'id', 'name', 'lights'}, ...]` (lights left to right) / the selected one or `None` |
+| `Lights` | `[{'id', 'name', 'status', 'on'}, ...]`; `on` is the Bridge's last known state |
+| `Mapping` | `[{'pixel', 'name', 'channel_id'}, ...]` in pixel order |
+| `Discover()`, `Connect(bridgeIp=None)`, `ForgetKey()` | Bridge discovery, connection and pairing |
+| `RefreshAreas()`, `SelectArea(area)` | Reload areas; select one |
+| `CreateArea(name=None, lights=None)`, `UpdateArea(lights=None)` | Create / update from these lights (default: the Lights in Area toggles) |
+| `DeleteArea(area=None)`, `DeleteLight(light)` | Delete without a confirmation dialog |
+| `SearchLights()` | Search for new lights |
+| `LightOn(lights=None)`, `LightOff(lights=None)`, `SetLight(lights, on)` | Switch lights over HTTPS whatever their current state. Lights of a streaming area ignore it (the stream owns them, and the stream itself cannot switch a light off) |
+| `StartStream(area=None)`, `StopStream()` | Enable Streaming on / off |
+| `SetColorFormat('xy' or 'rgb')` | Stream Color Format |
+| `CreateCallbacks()` | Same as Create Callbacks DAT |
 
-### TOXの作成・更新
+## Callbacks
 
-TouchDesignerのTextport（Alt+T）で実行します。`src/build_entertainment.py`の`ROOT`は配置先に合わせてください。
+`<name>_callbacks` (a Text DAT, Content Language: Python) works like the callbacks of an Execute DAT: define the functions you need and they are called on TouchDesigner's main thread. Every function receives the component as `comp`. Remove the ones you do not use. If a callback raises an error, it is written to `errors` and the component keeps running.
+
+| Callback | When |
+| --- | --- |
+| `onBridgesDiscovered(comp, bridges)` | Discover Bridges finished. `bridges`: `[{'id', 'ip'}, ...]` |
+| `onPaired(comp, bridgeIp)` | Pairing succeeded (new API key and client key) |
+| `onConnected(comp, bridgeIp)` | Areas and lights were read for the first time after connecting |
+| `onAreasChanged(comp, areas)` | After connecting, and whenever the areas on the Bridge change. `areas`: `[{'id', 'name', 'lights'}, ...]`, `lights` in left-to-right order |
+| `onLightsChanged(comp, lights)` | After connecting, and whenever lights are added, removed or renamed. `lights`: `[{'id', 'name', 'status'}, ...]` |
+| `onLightStatusChanged(comp, light, status, previous)` | A light's Zigbee status changed, e.g. `connected` to `connectivity_issue` |
+| `onSearchComplete(comp, newLights)` | Search New Lights finished. `newLights`: the lights that were not there before |
+| `onAreaCreated(comp, area)` / `onAreaUpdated(comp, area)` | Create Area / Update Selected Area succeeded (called once the new state has been read) |
+| `onAreaDeleted(comp, areaName)` / `onLightDeleted(comp, lightName)` | Delete Selected Area / Delete Selected Device succeeded |
+| `onStreamStart(comp, area)` | The stream is running; the lights follow the input TOP |
+| `onStreamStop(comp, area, reason)` | The stream stopped. `reason`: `disabled`, `area changed`, `area update`, `area deleted`, `light deleted`, `reconnect`, or `lost: <error>` (it retries after 3 s) |
+| `onMappingChanged(comp, mapping)` | The pixel order changed (lights added or removed, area updated, or a pixel edited). `mapping`: `[{'pixel', 'name', 'channel_id'}, ...]` in pixel order |
+| `onError(comp, message)` | A message was added to `errors` |
+
+There is no per-frame callback: use a CHOP or an Execute DAT for that.
+
+Example: show the stream state in a Text TOP.
+
+```python
+def onStreamStart(comp, area):
+	op('stream_state').par.text = 'Streaming ' + area['name']
+
+def onStreamStop(comp, area, reason):
+	op('stream_state').par.text = 'Stopped: ' + reason
+```
+
+## Troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| No Bridge found | Is the PC on the same network as the Bridge? Type the Bridge's IPv4 address into Bridge IP |
+| Pairing times out | Press Connect / Retry Pairing and press the Bridge's link button within 60 s |
+| Discovered, but cannot connect | With several network adapters (e.g. Wi-Fi and Ethernet), traffic to the Bridge may take the wrong route. Check with `Find-NetRoute -RemoteIPAddress <Bridge IP>` in PowerShell |
+| `No Entertainment areas yet` | Check the toggles under Lights in Area and press Create Area |
+| No lights under Lights in Area | Are colour-capable lights registered on the Bridge? Register them with Search New Lights, then press Refresh Areas |
+| `No light is selected` | Switch on at least one light under Lights in Area |
+| `Could not create/update/delete ...` | Check `errors`. An area holds at most 10 lights (switch some off) |
+| `Could not start the area` | Is another app (Hue Sync, another TouchDesigner) streaming on the same Bridge? Only one area per Bridge can stream at a time |
+| `Stream lost: Handshake timed out` | Is UDP 2100 blocked by the PC's firewall? Is the Bridge IP correct? |
+| `Stream lost: No Finished from Bridge` | The Client Key may not match. Use Forget Key / Pair Again |
+| Some lights do not react | Check their row under Registered Lights (should be `connected`) and `errors` for `not reachable`. Check power and distance to the Bridge |
+| The callbacks DAT is missing | A deleted callbacks DAT is not created again: press **Create Callbacks DAT** on the Setup page |
+| A light keeps an old colour | Is the input TOP at least as wide as the number of lights in the area? |
+
+## Communication and limits
+
+- Management (pairing, reading areas and lights, area and light operations) uses the Hue API v2 over HTTPS on one kept-alive connection. Light data uses the Entertainment API over DTLS on UDP 2100, sent by a dedicated thread at a steady rate. The stream keeps running even if TouchDesigner stalls, so the Bridge never times it out.
+- Areas, lights and their Zigbee status are refreshed about every 10 s, also while streaming.
+- Nothing waits on TouchDesigner's thread: HTTPS requests and Bridge discovery run on worker threads, the stream (including its encryption) on its own thread, and releasing the area on exit or rebuild on a short background thread. Per frame, the component only reads the input TOP and builds one small packet. Your callbacks run on TouchDesigner's thread, so keep them short.
+- Only one area per Bridge can stream at a time. While streaming, lights in the area cannot be controlled by other apps.
+- HTTPS certificate verification for the Bridge is currently disabled. Use the component on a trusted local network.
+
+## Saving and sharing
+
+The API Key and Client Key are stored in custom parameters, so **saving the TOE saves the keys**. Read-only only prevents editing in the UI; it is not encryption. Do not publish a paired TOE or a TOX you exported by hand. The `HueEntertainment.tox` in this repository is exported unpaired by the builder.
+
+## Development
+
+| File | Purpose |
+| --- | --- |
+| HueEntertainment.tox | The component (unpaired) |
+| src/dtls_psk.py | DTLS 1.2 client (PSK, TLS_PSK_WITH_AES_128_GCM_SHA256 only) with AES-128, GCM and the TLS 1.2 PRF in pure Python |
+| src/ent_core.py | HueStream v2 packets, colour conversion and smoothing, area and mapping helpers, the HTTPS client, mDNS Bridge discovery |
+| src/ent_runtime.py | Pairing, area and light management, the parameter-based light lists, stream start/stop and the sender thread |
+| src/ent_ext.py | The promoted Python extension (`LightOn`, `StartStream`, ...) |
+| src/build_entertainment.py | Creates or updates the component inside TouchDesigner and exports the unpaired TOX |
+| tests/ | Unit tests. With the `openssl` command available, a real DTLS handshake is tested too |
+
+### Building or updating the TOX
+
+Run this in TouchDesigner's Textport (Alt+T). Set `ROOT` in `src/build_entertainment.py` to where the repository is.
 
 ```python
 exec(open(r'C:/Users/sndmt/Documents/Github Projects/TouchDesigner-PhilipsHue/src/build_entertainment.py', encoding='utf-8').read())
 ```
 
-`/project1/HueEntertainment`がなければ作成し、あればキー・エリア・mappingを保ったままコードとパラメータを更新します。あわせて、リポジトリ直下に未ペアリングの`HueEntertainment.tox`を書き出します。結果は`build/entertainment_build.json`、失敗時は`build/entertainment_build_error.txt`に出力されます。
+If `/project1/HueEntertainment` does not exist it is created. Otherwise its code, parameters and operators are updated in place, keeping the keys, settings, area and mapping. The callbacks DAT is created next to the component if it has never had one. An unpaired `HueEntertainment.tox` is also written to the repository root. The result is written to `build/entertainment_build.json`, or `build/entertainment_build_error.txt` on failure.
+
+### Tests
+
+Run from the repository root (TouchDesigner's bundled Python works too):
+
+```sh
+python -m unittest discover -s tests
+```
